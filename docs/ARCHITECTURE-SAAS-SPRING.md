@@ -107,14 +107,18 @@ uz.<company>.crm
 **[р2] Направление зависимостей зафиксировано заранее.** Spring Modulith считает зависимостью и вызов API, и подписку на тип события чужого модуля, поэтому «payments вызывает billing, а billing слушает событие payments» — это цикл, и `verify()` упадёт. Разрешённый порядок (стрелка — «может зависеть от»):
 
 ```
-shared ← tenancy ← identity ← audit
-courses ← enrollment ← attendance ← billing ← payments ← payroll ← reporting
-students ← enrollment          platform, notifications, leads — сбоку, через события и API
+shared ← tenancy ← identity ← audit ← platform
+platform ← staff, students, courses
+staff, students, courses ← enrollment ← attendance ← billing ← payments ← payroll ← reporting
+students, enrollment ← leads
+всё выше ← notifications
 ```
 
 - Денежный счёт ученика целиком в `billing`. `payments` принимает деньги (касса, провайдеры) и в той же транзакции вызывает `billing.StudentAccountService.recordPayment(...)`. `billing` о `payments` не знает.
 - `payroll` читает `attendance` (кто вёл занятие) и `billing` (что начислено и оплачено за это занятие), в обратную сторону зависимостей нет.
-- `notifications` зависит от всех, от него — никто: остальные модули публикуют события, `notifications` на них подписан.
+- `notifications` зависит от всех, от него — никто: остальные модули публикуют события, `notifications` на них подписан. **Вход по SMS-коду тоже идёт так:** `identity` публикует `OtpRequested`, а не вызывает отправку SMS. Иначе `identity → notifications → identity` — цикл.
+- `platform` стоит **ниже** предметных модулей: `enrollment` при зачислении спрашивает `platform.PlanLimits`, можно ли добавить ученика, и передаёт текущее число сам. `platform` не читает учеников — тариф по числу учеников считается из событий `StudentEnrolled`/`StudentLeft` в собственный счётчик. Обратная зависимость дала бы цикл.
+- События без арендатора (`OtpRequested`, регистрация центра) — платформенные, из явного списка; остальные реализуют `TenantScopedEvent` (4.5).
 
 ---
 
@@ -131,7 +135,19 @@ students ← enrollment          platform, notifications, leads — сбоку, 
 
 Таблицы платформы без `tenant_id`: `tenant`, `user`, тарифы и подписки платформы, справочники платформы.
 
-**[р2] `membership` — не платформенная таблица.** В исходной редакции она была в списке таблиц без изоляции, но владелец центра читает её постоянно («сотрудники центра», «кто имеет доступ») — один запрос без фильтра, и он видит сотрудников всех центров. У `membership` своя политика RLS с двумя условиями: строка видна, если `tenant_id` = текущий арендатор **или** `user_id` = текущий пользователь (`app.user_id`, выставляется рядом с `app.tenant_id`). Второе условие нужно для экрана «мои центры» до выбора арендатора.
+**[р2] `membership` — не платформенная таблица.** В исходной редакции она была в списке таблиц без изоляции, но владелец центра читает её постоянно («сотрудники центра», «кто имеет доступ») — один запрос без фильтра, и он видит сотрудников всех центров. У `membership` своя политика RLS, и чтение и запись в ней **разные**:
+
+```sql
+CREATE POLICY membership_read ON membership FOR SELECT
+  USING (tenant_id = (SELECT NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+      OR user_id   = (SELECT NULLIF(current_setting('app.user_id',   true), '')::uuid));
+
+CREATE POLICY membership_write ON membership FOR INSERT, UPDATE, DELETE
+  USING      (tenant_id = (SELECT NULLIF(current_setting('app.tenant_id', true), '')::uuid))
+  WITH CHECK (tenant_id = (SELECT NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+```
+
+Условие по `user_id` нужно только для чтения — экран «мои центры» до выбора арендатора. В записи его быть не должно: иначе пользователь смог бы вставить членство **себе в любой центр**. Принятие приглашения (5.1) выполняется в контексте центра, который пригласил.
 
 **[р2] `User` хранит только данные входа** (телефон, email, Telegram, хеш пароля). ФИО, фото, дата рождения — в записях центра (`Staff`, `Student`, `Parent`) с `tenant_id`. Иначе центр А, добавляя сотрудника по телефону, видит имя, которое этот человек указал в центре Б, а правка профиля в одном центре меняет его во всех.
 
@@ -146,7 +162,7 @@ public abstract class TenantScopedEntity {
 }
 ```
 
-Все сущности с данными центра наследуют `TenantScopedEntity`. Hibernate сам добавляет условие по арендатору в запросы и сам проставляет `tenant_id` при вставке. Текущий арендатор Hibernate получает из `CurrentTenantIdentifierResolver`, который читает `TenantContext`.
+Все сущности с данными центра наследуют `TenantScopedEntity`. Hibernate сам добавляет условие по арендатору в запросы и сам проставляет `tenant_id` при вставке. Текущий арендатор Hibernate получает из `CurrentTenantIdentifierResolver`, который читает `TenantContext`. **[р2]** Без контекста (платформенные экраны, вход) резолвер возвращает нулевой UUID-заглушку, а не `null`: запрос к данным центра находит ноль строк, а вставка падает на внешнем ключе на `tenant`, а не записывает строку «ничью».
 
 **Тест ArchUnit:** каждая `@Entity` в модулях с данными центра наследует `TenantScopedEntity`, кроме явного списка таблиц платформы.
 
