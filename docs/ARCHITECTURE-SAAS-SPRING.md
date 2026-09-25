@@ -142,12 +142,12 @@ CREATE POLICY membership_read ON membership FOR SELECT
   USING (tenant_id = (SELECT NULLIF(current_setting('app.tenant_id', true), '')::uuid)
       OR user_id   = (SELECT NULLIF(current_setting('app.user_id',   true), '')::uuid));
 
-CREATE POLICY membership_write ON membership FOR INSERT, UPDATE, DELETE
+CREATE POLICY membership_write ON membership FOR ALL
   USING      (tenant_id = (SELECT NULLIF(current_setting('app.tenant_id', true), '')::uuid))
   WITH CHECK (tenant_id = (SELECT NULLIF(current_setting('app.tenant_id', true), '')::uuid));
 ```
 
-Условие по `user_id` нужно только для чтения — экран «мои центры» до выбора арендатора. В записи его быть не должно: иначе пользователь смог бы вставить членство **себе в любой центр**. Принятие приглашения (5.1) выполняется в контексте центра, который пригласил.
+Разрешающие политики объединяются через OR: чтение видит строки по любой из двух, а запись (`INSERT`/`UPDATE`/`DELETE`) проверяется только политикой `FOR ALL`. Условие по `user_id` нужно только для чтения — экран «мои центры» до выбора арендатора. В записи его быть не должно: иначе пользователь смог бы вставить членство **себе в любой центр**. Принятие приглашения (5.1) выполняется в контексте центра, который пригласил.
 
 **[р2] `User` хранит только данные входа** (телефон, email, Telegram, хеш пароля). ФИО, фото, дата рождения — в записях центра (`Staff`, `Student`, `Parent`) с `tenant_id`. Иначе центр А, добавляя сотрудника по телефону, видит имя, которое этот человек указал в центре Б, а правка профиля в одном центре меняет его во всех.
 
